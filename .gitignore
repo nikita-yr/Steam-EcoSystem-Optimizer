@@ -1,0 +1,8 @@
+# Generated at runtime — machine-specific, never commit
+src/gamelist.json
+src/*.log
+
+# Windows / editor noise
+Thumbs.db
+.vs/
+*.user
