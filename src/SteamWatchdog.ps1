@@ -1,37 +1,48 @@
-# ====================================================================
+﻿# ====================================================================
 # SteamWatchdog.ps1
 #
 # Persistent Steam background optimizer (SESO - Steam Ecosystem Optimizer).
 #
-# Features:
-# - Detect Steam games start/stop
-# - Switch Steam UI mode
-# - Maintain live game database
-# - Watch Steam manifests
-# - Surgical SteamWebHelper RAM offloading (kills renderers, keeps core)
-# - Safe recovery from missing Steam libraries
+# - Detects Steam game start/stop (event-driven ETW trace when elevated,
+#   WMI polling filtered to steamapps\common otherwise)
+# - Switches Steam UI to Mini Games List while playing
+# - Puts steamwebhelper into background mode (trim RAM, EcoQoS,
+#   low memory/CPU priority) instead of killing it
+# - Debounced restore: game-to-game switches never flip the Steam UI
+# - Keeps the game database in sync via manifest watchers
 # ====================================================================
 
 . (Join-Path $PSScriptRoot "Common.ps1")
 
-$CachePath = Join-Path $PSScriptRoot "gamelist.json"
-$LogPath   = Join-Path $PSScriptRoot "watchdog.log"
+# Single instance per user session
+$createdNew = $false
+$Global:SesoMutex = New-Object System.Threading.Mutex($true, "Local\SESO_SteamWatchdog", [ref]$createdNew)
+if (-not $createdNew) { exit }
+
+# Global: these are read from event-action scopes too
+$Global:CachePath       = Join-Path $PSScriptRoot "gamelist.json"
+$Global:LogPath         = Join-Path $PSScriptRoot "watchdog.log"
+$Global:RestoreDelaySec = 15     # wait before restoring Steam after the last game exits
+$Global:RetrimEverySec  = 60     # re-apply background mode while a game runs
+$Global:LogMaxBytes     = 256KB
 
 
 function Global:Write-Log {
-    param(
-        $Message,
-        $Color = "White"
-    )
-
+    param($Message, $Color = "White")
     $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+    try { Add-Content -Path $LogPath -Value $line -Encoding UTF8 } catch {}
+    Write-Host $line -ForegroundColor $Color
+}
 
+
+function Global:Limit-Log {
     try {
-        Add-Content -Path $LogPath -Value $line -Encoding UTF8
+        if ((Test-Path $LogPath) -and (Get-Item $LogPath).Length -gt $LogMaxBytes) {
+            $tail = Get-Content $LogPath -Tail 1000 -Encoding UTF8
+            Set-Content -Path $LogPath -Value $tail -Encoding UTF8
+        }
     }
     catch {}
-
-    Write-Host $line -ForegroundColor $Color
 }
 
 
@@ -41,34 +52,26 @@ function Global:Write-Log {
 
 $Global:WatchdogState = [hashtable]::Synchronized(@{
     Games           = @()
-    TargetGames     = @()
-    TargetNames     = @()
+    TargetGames     = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    NonGames        = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     ActiveProcesses = [hashtable]::Synchronized(@{})
-    LastLoaded      = $null
-    LastLogCleanup  = $null
-    LastSteamStart  = (Get-Date).AddMinutes(-10)
     PendingAppIds   = [hashtable]::Synchronized(@{})
     PendingRescan   = [hashtable]::Synchronized(@{})
+    LastSteamStart  = (Get-Date).AddMinutes(-10)
+    SteamPid        = (Get-Process steam -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1).Id
+    Optimized       = $false
+    RestoreAt       = $null
+    LastRetrim      = Get-Date
+    LastLogCheck    = Get-Date
 })
 
 
-function Global:Get-ActiveGameCount {
-    return $Global:WatchdogState.ActiveProcesses.Count
-}
-
-
 function Global:Rebuild-TargetLists {
-    $allPaths = @()
+    $set = $Global:WatchdogState.TargetGames
+    $set.Clear()
     foreach ($game in @($Global:WatchdogState.Games)) {
-        if ($game.ExePaths) {
-            $allPaths += @($game.ExePaths)
-        }
+        foreach ($p in @($game.ExePaths)) { if ($p) { [void]$set.Add($p) } }
     }
-
-    $Global:WatchdogState.TargetGames = @($allPaths)
-    $Global:WatchdogState.TargetNames = @($allPaths | ForEach-Object {
-        Split-Path $_ -Leaf
-    })
 }
 
 
@@ -78,582 +81,310 @@ function Global:Rebuild-TargetLists {
 
 function Global:Save-Cache {
     try {
-        $cache = @{
+        @{
             GeneratedAt = (Get-Date).ToString("o")
             Count       = $Global:WatchdogState.Games.Count
             Games       = $Global:WatchdogState.Games
-        }
-
-        $cache |
-            ConvertTo-Json -Depth 5 |
-            Set-Content -Path $CachePath -Encoding UTF8
+        } | ConvertTo-Json -Depth 5 | Set-Content -Path $CachePath -Encoding UTF8
     }
-    catch {
-        Write-Log "Cache save failed: $_" "Red"
-    }
+    catch { Write-Log "Cache save failed: $_" "Red" }
 }
 
 
 function Global:Load-GameCache {
     if (-not (Test-Path $CachePath)) {
-        Write-Log "Cache not found. Run scanner first." "Red"
+        Write-Log "Cache not found. Unknown games will be detected on first launch." "DarkGray"
         return
     }
-
     try {
         $data = Get-Content $CachePath -Raw -Encoding UTF8 | ConvertFrom-Json
-
         $Global:WatchdogState.Games = @($data.Games)
         Rebuild-TargetLists
-        $Global:WatchdogState.LastLoaded = Get-Date
-
         Write-Log "Cache loaded: $($Global:WatchdogState.Games.Count) games, $($Global:WatchdogState.TargetGames.Count) executables" "Cyan"
     }
-    catch {
-        Write-Log "Cache load failed: $_" "Red"
-    }
+    catch { Write-Log "Cache load failed: $_" "Red" }
 }
 
-
-# ====================================================================
-# PROCESS PATH RESOLUTION
-# ====================================================================
-
-function Global:Resolve-ExePath {
-    param($TargetInstance)
-
-    if ($TargetInstance.ExecutablePath) {
-        return $TargetInstance.ExecutablePath
-    }
-
-    $procId = $TargetInstance.ProcessId
-
-    if (-not $procId) {
-        return $null
-    }
-
-    try {
-        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction Stop
-        if ($proc.ExecutablePath) {
-            return $proc.ExecutablePath
-        }
-    }
-    catch {}
-
-    try {
-        $p = Get-Process -Id $procId -ErrorAction Stop
-        if ($p.Path) {
-            return $p.Path
-        }
-    }
-    catch {}
-
-    return $null
-}
-
-
-# ====================================================================
-# LOG CLEANUP
-# ====================================================================
-
-function Global:Invoke-WeeklyLogCleanup {
-    $now = Get-Date
-
-    if ($Global:WatchdogState.LastLogCleanup -and (($now - $Global:WatchdogState.LastLogCleanup).TotalHours -lt 24)) {
-        return
-    }
-
-    $Global:WatchdogState.LastLogCleanup = $now
-
-    Get-ChildItem -Path $PSScriptRoot -Filter "*.log" -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        if ((($now - $_.LastWriteTime).TotalDays) -ge 7) {
-            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-
-# ====================================================================
-# STEAM UI SWITCH
-# ====================================================================
-
-function Global:Switch-SteamView {
-    param(
-        [ValidateSet("minigameslist", "largegameslist")]
-        $Mode
-    )
-
-    $steam = Get-Process "steam" -ErrorAction SilentlyContinue | Select-Object -First 1
-
-    if (-not $steam) {
-        try {
-            Set-ItemProperty -Path "HKCU:\Software\Valve\Steam" -Name "LastGameListUsed" -Value $Mode -ErrorAction Stop
-            Write-Log "Steam closed. Registry set: $Mode" "DarkGray"
-        }
-        catch {
-            Write-Log "Registry write failed: $_" "Red"
-        }
-        return
-    }
-
-    try {
-        $seconds = ((Get-Date) - $steam.StartTime).TotalSeconds
-
-        if ($Mode -eq "largegameslist" -and $seconds -lt 30) {
-            Set-ItemProperty -Path "HKCU:\Software\Valve\Steam" -Name "LastGameListUsed" -Value $Mode
-            Write-Log "Steam startup detected. Registry only." "DarkGray"
-            return
-        }
-
-        Start-Process "steam://open/$Mode"
-        Write-Log "Steam switched to $Mode" "Cyan"
-    }
-    catch {
-        Write-Log "Steam switch failed: $_" "Red"
-    }
-}
-
-
-# ====================================================================
-# STEAM LIBRARIES
-# ====================================================================
-
-function Global:Get-SteamLibraryPaths {
-    $paths = @()
-
-    try {
-        $steamPath = (Get-ItemProperty "HKCU:\Software\Valve\Steam" -Name "SteamPath" -ErrorAction SilentlyContinue).SteamPath
-
-        if ($steamPath -and (Test-Path $steamPath -ErrorAction SilentlyContinue)) {
-            $paths += $steamPath
-        }
-
-        if ($steamPath) {
-            $vdf = Join-Path $steamPath "steamapps\libraryfolders.vdf"
-
-            if (Test-Path $vdf -ErrorAction SilentlyContinue) {
-                $content = Get-Content $vdf -Raw -ErrorAction SilentlyContinue
-                $matches = [regex]::Matches($content, '"path"\s+"([^"]+)"')
-
-                foreach ($m in $matches) {
-                    $path = $m.Groups[1].Value -replace '\\\\', '\'
-
-                    if (Test-Path -Path $path -ErrorAction SilentlyContinue) {
-                        $paths += $path
-                    }
-                }
-            }
-        }
-    }
-    catch {
-        Write-Log "Steam library scan failed: $_" "Red"
-    }
-
-    return $paths | ForEach-Object { $_.TrimEnd('\', '/') } | Sort-Object -Unique
-}
-
-
-# ====================================================================
-# MANIFEST
-# ====================================================================
-
-function Global:Read-SteamManifest {
-    param(
-        $ManifestPath,
-        $CommonPath
-    )
-
-    try {
-        $content = Get-Content $ManifestPath -Raw -Encoding UTF8
-
-        $appId   = [regex]::Match($content, '"appid"\s+"(\d+)"').Groups[1].Value
-        $name    = [regex]::Match($content, '"name"\s+"([^"]+)"').Groups[1].Value
-        $install = [regex]::Match($content, '"installdir"\s+"([^"]+)"').Groups[1].Value
-
-        if (-not $appId -or -not $name) {
-            return $null
-        }
-
-        $gamePath = Join-Path $CommonPath $install
-        $exePaths = @()
-
-        if (Test-Path $gamePath) {
-            $exePaths = Get-ChildItem -Path $gamePath -Filter "*.exe" -Recurse -Depth 2 -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty FullName
-        }
-
-        return [PSCustomObject]@{
-            AppId    = $appId
-            Name     = $name
-            ExePaths = @($exePaths)
-        }
-    }
-    catch {
-        Write-Log "Manifest error $ManifestPath : $_" "Red"
-        return $null
-    }
-}
-
-
-# ====================================================================
-# GAME DATABASE UPDATE
-# ====================================================================
 
 function Global:Add-OrUpdateGame {
-    param(
-        $ManifestPath,
-        $CommonPath
-    )
+    param($ManifestPath, $CommonPath)
 
     $game = Read-SteamManifest -ManifestPath $ManifestPath -CommonPath $CommonPath
+    if (-not $game) { return $null }
 
-    if (-not $game) {
-        return
-    }
-
-    $Global:WatchdogState.Games = @(
-        $Global:WatchdogState.Games | Where-Object { $_.AppId -ne $game.AppId }
-    )
-
-    $Global:WatchdogState.Games += $game
-
+    $Global:WatchdogState.Games = @($Global:WatchdogState.Games | Where-Object { $_.AppId -ne $game.AppId }) + $game
     Rebuild-TargetLists
     Save-Cache
-
     Write-Log "Game updated: $($game.Name) ($($game.AppId))" "Green"
+    return $game
 }
 
 
 function Global:Remove-Game {
     param($AppId)
 
-    if (-not $AppId) {
-        return
-    }
-
     $old = $Global:WatchdogState.Games | Where-Object { $_.AppId -eq $AppId }
+    if (-not $old) { return }
 
-    if (-not $old) {
-        return
-    }
-
-    $Global:WatchdogState.Games = @(
-        $Global:WatchdogState.Games | Where-Object { $_.AppId -ne $AppId }
-    )
-
+    $Global:WatchdogState.Games = @($Global:WatchdogState.Games | Where-Object { $_.AppId -ne $AppId })
     Rebuild-TargetLists
     Save-Cache
-
     Write-Log "Game removed: $($old.Name)" "Magenta"
 }
 
 
 # ====================================================================
-# START CACHE
+# STEAM UI + BACKGROUND MODE
 # ====================================================================
 
+function Global:Switch-SteamView {
+    param([ValidateSet("minigameslist", "largegameslist")] $Mode)
+
+    $steam = Get-Process "steam" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    # Steam closed or just starting: only set the registry value it reads on start
+    if (-not $steam -or ($Mode -eq "largegameslist" -and ((Get-Date) - $steam.StartTime).TotalSeconds -lt 30)) {
+        try {
+            Set-ItemProperty -Path "HKCU:\Software\Valve\Steam" -Name "LastGameListUsed" -Value $Mode -ErrorAction Stop
+            Write-Log "Registry set: $Mode" "DarkGray"
+        }
+        catch { Write-Log "Registry write failed: $_" "Red" }
+        return
+    }
+
+    try {
+        Start-Process "steam://open/$Mode"
+        Write-Log "Steam switched to $Mode" "Cyan"
+    }
+    catch { Write-Log "Steam switch failed: $_" "Red" }
+}
+
+
+function Global:Enter-GameMode {
+    $state = $Global:WatchdogState
+    $state.RestoreAt = $null
+    if ($state.Optimized) { return }   # game-to-game: Steam is already optimized
+
+    $state.Optimized = $true
+    # Steam is busy for a while after a launch (overlay, cloud sync) and pulls
+    # pages back in, so the first re-trim comes 20 s later, then every minute.
+    $state.LastRetrim = (Get-Date).AddSeconds(20 - $Global:RetrimEverySec)
+    Switch-SteamView -Mode "minigameslist"
+    $r = Set-SteamHelpersMode -Mode Game
+    Write-Log "Background mode: $($r.Count) helpers, trimmed $($r.TrimmedMB) MB" "Cyan"
+}
+
+
+function Global:Exit-GameMode {
+    $state = $Global:WatchdogState
+    $state.RestoreAt = $null
+    $state.Optimized = $false
+    Set-SteamHelpersMode -Mode Normal | Out-Null
+    Switch-SteamView -Mode "largegameslist"
+}
+
+
+# ====================================================================
+# PROCESS EVENTS
+# ====================================================================
+
+function Global:On-ProcessStart {
+    param($ProcessId, $Name, $ExePath)
+
+    $state = $Global:WatchdogState
+
+    if ($Name -eq "steam.exe") {
+        # steam:// links spawn a short-lived second steam.exe that forwards
+        # the command to the running client; only a new main client counts.
+        $now = Get-Date
+        if ($state.SteamPid -and (Get-Process -Id $state.SteamPid -ErrorAction SilentlyContinue)) { return }
+        $state.SteamPid = $ProcessId
+        if (($now - $state.LastSteamStart).TotalSeconds -gt 30) {
+            $state.LastSteamStart = $now
+            $state.Optimized = $false
+            Set-ItemProperty -Path "HKCU:\Software\Valve\Steam" -Name "LastGameListUsed" -Value "largegameslist" -ErrorAction SilentlyContinue
+            Write-Log "Steam started" "Cyan"
+        }
+        return
+    }
+
+    if (-not $ExePath) {
+        try { $ExePath = [SESO.Native]::GetPath($ProcessId) } catch { return }
+    }
+    if (-not $ExePath -or $ExePath -notlike "*\steamapps\common\*") { return }
+    if ($state.NonGames.Contains($ExePath)) { return }
+
+    if (-not $state.TargetGames.Contains($ExePath)) {
+        $state.PendingRescan[$ProcessId] = @{ Name = $Name; ExePath = $ExePath }
+        return
+    }
+
+    if ($state.ActiveProcesses.ContainsKey($ProcessId)) { return }
+    $state.ActiveProcesses[$ProcessId] = $ExePath
+    Write-Log "Game started: $Name PID=$ProcessId Active=$($state.ActiveProcesses.Count)" "Yellow"
+    Enter-GameMode
+}
+
+
+function Global:On-ProcessStop {
+    param($ProcessId, $Name)
+
+    $state = $Global:WatchdogState
+    $state.PendingRescan.Remove($ProcessId)
+    if (-not $state.ActiveProcesses.ContainsKey($ProcessId)) { return }
+
+    $exe = Split-Path $state.ActiveProcesses[$ProcessId] -Leaf   # ETW truncates names to 15 chars
+    $state.ActiveProcesses.Remove($ProcessId)
+    $count = $state.ActiveProcesses.Count
+    Write-Log "Game stopped: $exe Active=$count" "Yellow"
+
+    if ($count -eq 0) {
+        $state.RestoreAt = (Get-Date).AddSeconds($Global:RestoreDelaySec)
+    }
+}
+
+
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+try {
+    if (-not $isAdmin) { throw "not elevated" }
+
+    # Event-driven (ETW): zero cost while nothing starts, no polling
+    Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStartTrace" -SourceIdentifier "SesoStart" -ErrorAction Stop -Action {
+        try {
+            $e = $Event.SourceEventArgs.NewEvent
+            On-ProcessStart -ProcessId ([int]$e.ProcessID) -Name $e.ProcessName -ExePath $null
+        }
+        catch { Write-Log "Start event error: $_" "Red" }
+    } | Out-Null
+
+    Register-CimIndicationEvent -Query "SELECT * FROM Win32_ProcessStopTrace" -SourceIdentifier "SesoStop" -ErrorAction Stop -Action {
+        try {
+            $e = $Event.SourceEventArgs.NewEvent
+            On-ProcessStop -ProcessId ([int]$e.ProcessID) -Name $e.ProcessName
+        }
+        catch { Write-Log "Stop event error: $_" "Red" }
+    } | Out-Null
+
+    Write-Log "Process tracking: ETW trace" "DarkGray"
+}
+catch {
+    Get-EventSubscriber -SourceIdentifier "SesoStart" -ErrorAction SilentlyContinue | Unregister-Event
+
+    # Fallback: WMI polling, filtered so only Steam and steamapps\common
+    # processes ever reach PowerShell ("_" matches the backslash).
+    $filter = "(TargetInstance.Name = 'steam.exe' OR TargetInstance.ExecutablePath LIKE '%_steamapps_common_%')"
+
+    Register-CimIndicationEvent -Query "SELECT * FROM __InstanceCreationEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_Process' AND $filter" -SourceIdentifier "SesoStart" -Action {
+        try {
+            $p = $Event.SourceEventArgs.NewEvent.TargetInstance
+            On-ProcessStart -ProcessId ([int]$p.ProcessId) -Name $p.Name -ExePath $p.ExecutablePath
+        }
+        catch { Write-Log "Start event error: $_" "Red" }
+    } | Out-Null
+
+    Register-CimIndicationEvent -Query "SELECT * FROM __InstanceDeletionEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_Process' AND $filter" -SourceIdentifier "SesoStop" -Action {
+        try {
+            $p = $Event.SourceEventArgs.NewEvent.TargetInstance
+            On-ProcessStop -ProcessId ([int]$p.ProcessId) -Name $p.Name
+        }
+        catch { Write-Log "Stop event error: $_" "Red" }
+    } | Out-Null
+
+    Write-Log "Process tracking: WMI polling (filtered)" "DarkGray"
+}
+
+
+# ====================================================================
+# STARTUP
+# ====================================================================
+
+Limit-Log
 Load-GameCache
 
-
-# ====================================================================
-# FILE WATCHERS
-# ====================================================================
-
-$libraryPaths = Get-SteamLibraryPaths
 $manifestWatchers = @()
-
-foreach ($library in $libraryPaths) {
+foreach ($library in Get-SteamLibraryPaths) {
     $steamapps = Join-Path $library "steamapps"
-    $common    = Join-Path $steamapps "common"
-
-    if (-not (Test-Path $steamapps)) {
-        continue
-    }
+    if (-not (Test-Path $steamapps)) { continue }
 
     try {
-        $watcher = New-Object System.IO.FileSystemWatcher
-        $watcher.Path = $steamapps
-        $watcher.Filter = "appmanifest_*.acf"
+        $watcher = New-Object System.IO.FileSystemWatcher $steamapps, "appmanifest_*.acf"
         $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName, [System.IO.NotifyFilters]::LastWrite
         $watcher.EnableRaisingEvents = $true
-
         $manifestWatchers += $watcher
-        $id = [guid]::NewGuid().ToString("N").Substring(0, 8)
 
-        Register-ObjectEvent -InputObject $watcher -EventName Created -SourceIdentifier "ManifestCreated_$id" -MessageData $common -Action {
-            $appId = [regex]::Match($Event.SourceEventArgs.Name, 'appmanifest_(\d+)\.acf').Groups[1].Value
-
-            if ($appId) {
-                $Global:WatchdogState.PendingAppIds[$appId] = @{
-                    ManifestPath = $Event.SourceEventArgs.FullPath
-                    CommonPath   = $Event.MessageData
-                    LastWrite    = Get-Date
-                    Action       = "Add"
+        foreach ($evt in "Created", "Changed", "Deleted") {
+            Register-ObjectEvent -InputObject $watcher -EventName $evt -MessageData (Join-Path $steamapps "common") -Action {
+                $appId = Get-AppIdFromManifestPath -ManifestPath $Event.SourceEventArgs.Name
+                if ($appId) {
+                    $Global:WatchdogState.PendingAppIds[$appId] = @{
+                        ManifestPath = $Event.SourceEventArgs.FullPath
+                        CommonPath   = $Event.MessageData
+                        LastWrite    = Get-Date
+                        Action       = $(if ($Event.SourceEventArgs.ChangeType -eq "Deleted") { "Remove" } else { "Add" })
+                    }
                 }
-            }
-        } | Out-Null
-
-        Register-ObjectEvent -InputObject $watcher -EventName Changed -SourceIdentifier "ManifestChanged_$id" -MessageData $common -Action {
-            $appId = [regex]::Match($Event.SourceEventArgs.Name, 'appmanifest_(\d+)\.acf').Groups[1].Value
-
-            if ($appId) {
-                $Global:WatchdogState.PendingAppIds[$appId] = @{
-                    ManifestPath = $Event.SourceEventArgs.FullPath
-                    CommonPath   = $Event.MessageData
-                    LastWrite    = Get-Date
-                    Action       = "Add"
-                }
-            }
-        } | Out-Null
-
-        Register-ObjectEvent -InputObject $watcher -EventName Deleted -SourceIdentifier "ManifestDeleted_$id" -Action {
-            $appId = [regex]::Match($Event.SourceEventArgs.Name, 'appmanifest_(\d+)\.acf').Groups[1].Value
-
-            if ($appId) {
-                $Global:WatchdogState.PendingAppIds[$appId] = @{
-                    AppId     = $appId
-                    LastWrite = Get-Date
-                    Action    = "Remove"
-                }
-            }
-        } | Out-Null
+            } | Out-Null
+        }
     }
-    catch {
-        Write-Log "Watcher failed for $library : $_" "Red"
-    }
+    catch { Write-Log "Watcher failed for $library : $_" "Red" }
 }
 
-Write-Log "Watching $($manifestWatchers.Count) Steam libraries" "Cyan"
+Write-Log "Steam-Watchdog active, watching $($manifestWatchers.Count) libraries" "Green"
 
 
 # ====================================================================
-# SURGICAL STEAM WEB HELPER RAM CLEANER (SESO)
-# ====================================================================
-
-function Global:Invoke-SteamWebHelperOffload {
-    $helpers = Get-CimInstance Win32_Process -Filter "Name='steamwebhelper.exe'" -ErrorAction SilentlyContinue
-
-    if (-not $helpers) {
-        return
-    }
-
-    $steam = Get-Process steam -ErrorAction SilentlyContinue | Select-Object -First 1
-
-    if (-not $steam) {
-        return
-    }
-
-    # Идентифицируем главный процесс MAIN (у него обычно нет аргумента --type=)
-    $main = $helpers | Where-Object {
-        $_.ParentProcessId -eq $steam.Id -and $_.CommandLine -notmatch '--type='
-    } | Select-Object -First 1
-
-    $killed = 0
-
-    foreach ($h in $helpers) {
-        $cmd = $h.CommandLine
-
-        # 1. Пропускаем главный процесс (MAIN)
-        if ($main -and $h.ProcessId -eq $main.ProcessId) {
-            continue
-        }
-
-        # 2. Пропускаем GPU-процесс (оверлей и графическое сведение)
-        if ($cmd -match '--type=gpu-process') {
-            continue
-        }
-
-        # 3. Пропускаем NetworkService (чат, список друзей, сетевые сервисы)
-        if ($cmd -match 'network\.mojom\.NetworkService') {
-            continue
-        }
-
-        # 4. Завершаем ТОЛЬКО лишние вкладки/рендереры (renderer, utility, storage, crashpad)
-        $ram = [math]::Round($h.WorkingSet / 1MB, 1)
-
-        Stop-Process -Id $h.ProcessId -Force -ErrorAction SilentlyContinue
-        $killed++
-
-        Write-Log "SteamWebHelper offloaded: PID $($h.ProcessId), RAM $ram MB" "DarkGray"
-    }
-
-    Write-Log "SteamWebHelper offload finished: $killed processes removed" "Cyan"
-}
-
-
-# ====================================================================
-# PROCESS WATCHING
-# ====================================================================
-
-$StartQuery = "SELECT * FROM __InstanceCreationEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_Process'"
-$StopQuery  = "SELECT * FROM __InstanceDeletionEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_Process'"
-
-Register-CimIndicationEvent -Query $StartQuery -SourceIdentifier "AutoGameStarted" -Action {
-    try {
-        $proc = $Event.SourceEventArgs.NewEvent.TargetInstance
-        $state = $Global:WatchdogState
-        $processId = $proc.ProcessId
-        $name = $proc.Name
-
-        # Steam started
-        if ($name -eq "steam.exe") {
-            $now = Get-Date
-            if (($now - $state.LastSteamStart).TotalSeconds -gt 30) {
-                $state.LastSteamStart = $now
-                Set-ItemProperty -Path "HKCU:\Software\Valve\Steam" -Name "LastGameListUsed" -Value "largegameslist" -ErrorAction SilentlyContinue
-                Write-Log "Steam started" "Cyan"
-            }
-            return
-        }
-
-        $exe = Resolve-ExePath -TargetInstance $proc
-
-        if (-not $exe) {
-            return
-        }
-
-        # unknown exe
-        if ($state.TargetGames -notcontains $exe) {
-            $state.PendingRescan[$processId] = @{
-                Name      = $name
-                ExePath   = $exe
-                Timestamp = Get-Date
-            }
-            return
-        }
-
-        if ($state.ActiveProcesses.ContainsKey($processId)) {
-            return
-        }
-
-        $state.ActiveProcesses[$processId] = $exe
-        $count = Get-ActiveGameCount
-
-        Write-Log "Game started: $name PID=$processId Active=$count" "Yellow"
-
-        if ($count -eq 1) {
-            Switch-SteamView -Mode "minigameslist"
-            Invoke-SteamWebHelperOffload
-        }
-    }
-    catch {
-        Write-Log "Start event error: $_" "Red"
-    }
-} | Out-Null
-
-
-Register-CimIndicationEvent -Query $StopQuery -SourceIdentifier "AutoGameStopped" -Action {
-    try {
-        $proc = $Event.SourceEventArgs.NewEvent.TargetInstance
-        $state = $Global:WatchdogState
-        $processId = $proc.ProcessId
-        $name = $proc.Name
-
-        if ($state.ActiveProcesses.ContainsKey($processId)) {
-            $state.ActiveProcesses.Remove($processId)
-            $count = Get-ActiveGameCount
-
-            Write-Log "Game stopped: $name Active=$count" "Yellow"
-
-            if ($count -eq 0) {
-                Start-Sleep -Milliseconds 1500
-                if ((Get-ActiveGameCount) -eq 0) {
-                    Switch-SteamView -Mode "largegameslist"
-                }
-            }
-        }
-    }
-    catch {
-        Write-Log "Stop event error: $_" "Red"
-    }
-} | Out-Null
-
-Write-Log "Steam-Watchdog active" "Green"
-
-
-# ====================================================================
-# PENDING MANIFEST UPDATE
+# MAIN LOOP HELPERS
 # ====================================================================
 
 function Global:Invoke-PendingManifestChecks {
-    if ($Global:WatchdogState.PendingAppIds.Count -eq 0) {
-        return
-    }
-
     $now = Get-Date
-
     foreach ($id in @($Global:WatchdogState.PendingAppIds.Keys)) {
         $item = $Global:WatchdogState.PendingAppIds[$id]
-
-        if (-not $item) {
-            continue
-        }
-
-        if (($now - $item.LastWrite).TotalSeconds -lt 3) {
-            continue
-        }
+        if (-not $item -or ($now - $item.LastWrite).TotalSeconds -lt 3) { continue }
 
         $Global:WatchdogState.PendingAppIds.Remove($id)
-
-        if ($item.Action -eq "Remove") {
-            Remove-Game -AppId $id
-        }
-        else {
-            Add-OrUpdateGame -ManifestPath $item.ManifestPath -CommonPath $item.CommonPath
-        }
+        if ($item.Action -eq "Remove") { Remove-Game -AppId $id }
+        else { [void](Add-OrUpdateGame -ManifestPath $item.ManifestPath -CommonPath $item.CommonPath) }
     }
 }
 
 
-# ====================================================================
-# UNKNOWN PROCESS RESCAN
-# ====================================================================
-
 function Global:Invoke-PendingRescan {
-    $now = Get-Date
+    # Targeted: only the manifest whose installdir owns this exe is parsed.
+    $state = $Global:WatchdogState
 
-    foreach ($processId in @($Global:WatchdogState.PendingRescan.Keys)) {
-        $item = $Global:WatchdogState.PendingRescan[$processId]
+    foreach ($processId in @($state.PendingRescan.Keys)) {
+        $item = $state.PendingRescan[$processId]
+        $state.PendingRescan.Remove($processId)
+        if (-not $item) { continue }
 
-        if (-not $item) {
+        $m = [regex]::Match($item.ExePath, '^(.*\\steamapps)\\common\\([^\\]+)\\', 'IgnoreCase')
+        if (-not $m.Success) { continue }
+        $steamapps = $m.Groups[1].Value
+        $installDir = $m.Groups[2].Value
+
+        $game = $null
+        foreach ($manifest in Get-ChildItem $steamapps -Filter "appmanifest_*.acf" -ErrorAction SilentlyContinue) {
+            $dir = [regex]::Match([IO.File]::ReadAllText($manifest.FullName), '"installdir"\s+"([^"]+)"').Groups[1].Value
+            if ($dir -eq $installDir) {
+                $game = Add-OrUpdateGame -ManifestPath $manifest.FullName -CommonPath (Join-Path $steamapps "common")
+                break
+            }
+        }
+
+        if (-not $state.TargetGames.Contains($item.ExePath)) {
+            [void]$state.NonGames.Add($item.ExePath)   # helper exe inside a game folder
             continue
         }
 
-        if (($now - $item.Timestamp).TotalSeconds -lt 5) {
-            continue
-        }
+        # The process may have exited while we were looking it up
+        if (-not (Get-Process -Id $processId -ErrorAction SilentlyContinue)) { continue }
 
-        $Global:WatchdogState.PendingRescan.Remove($processId)
-
-        foreach ($library in Get-SteamLibraryPaths) {
-            $steamapps = Join-Path $library "steamapps"
-            $common    = Join-Path $steamapps "common"
-
-            if (-not (Test-Path $steamapps)) {
-                continue
-            }
-
-            foreach ($manifest in Get-ChildItem $steamapps -Filter "appmanifest_*.acf" -ErrorAction SilentlyContinue) {
-                $game = Read-SteamManifest -ManifestPath $manifest.FullName -CommonPath $common
-
-                if (-not $game) {
-                    continue
-                }
-
-                foreach ($exe in $game.ExePaths) {
-                    if ($exe -eq $item.ExePath) {
-                        $Global:WatchdogState.ActiveProcesses[$processId] = $item.ExePath
-
-                        Write-Log "Detected game: $($game.Name)" "Yellow"
-
-                        Switch-SteamView -Mode "minigameslist"
-                        Invoke-SteamWebHelperOffload
-                        return
-                    }
-                }
-            }
-        }
+        $state.ActiveProcesses[$processId] = $item.ExePath
+        Write-Log "Detected game: $($game.Name) PID=$processId Active=$($state.ActiveProcesses.Count)" "Yellow"
+        Enter-GameMode
     }
 }
 
@@ -664,7 +395,23 @@ function Global:Invoke-PendingRescan {
 
 while ($true) {
     Start-Sleep -Seconds 1
-    Invoke-WeeklyLogCleanup
-    Invoke-PendingManifestChecks
-    Invoke-PendingRescan
+    $state = $Global:WatchdogState
+    $now = Get-Date
+
+    if ($state.PendingAppIds.Count) { Invoke-PendingManifestChecks }
+    if ($state.PendingRescan.Count) { Invoke-PendingRescan }
+
+    if ($state.RestoreAt -and $now -ge $state.RestoreAt -and $state.ActiveProcesses.Count -eq 0) {
+        Exit-GameMode
+    }
+
+    if ($state.Optimized -and $state.ActiveProcesses.Count -gt 0 -and ($now - $state.LastRetrim).TotalSeconds -ge $Global:RetrimEverySec) {
+        $state.LastRetrim = $now
+        [void](Set-SteamHelpersMode -Mode Game)
+    }
+
+    if (($now - $state.LastLogCheck).TotalHours -ge 24) {
+        $state.LastLogCheck = $now
+        Limit-Log
+    }
 }

@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  Cuts Steam's RAM usage by <b>~47%</b> while you play, reclaiming around <b>800 MB</b> of memory — helping reduce micro-stutters and improve 1% Low FPS.<br>
+  Cuts Steam's RAM footprint by <b>~75–85%</b> while you play (measured: <b>1.6 GB → 0.2–0.6 GB</b>) — helping reduce micro-stutters and improve 1% Low FPS.<br>
   No clicks. No background UI clutter. No configuration.
 </p>
 
@@ -26,72 +26,42 @@
 
 Steam keeps multiple Chromium (`steamwebhelper.exe`) processes alive even while you're in-game. Those background web views can consume **1.5–1.7 GB of RAM**, increasing paging activity and causing inconsistent frame times on memory-constrained systems.
 
-SESO watches for game launches in the background and surgically terminates the browser-tab renderer processes — the ones rendering the Store, Library, and Community pages — while keeping the Steam interface, Friends list, overlay, and network stack alive. When you close the game, Steam restores everything on demand.
+SESO watches for game launches in the background and puts every `steamwebhelper` into a *background mode* using documented Windows APIs: its memory is moved out of RAM, it gets the lowest memory priority, Efficiency mode (EcoQoS) and below-normal CPU priority. Nothing is killed, so Steam, the overlay, friends and chat keep working. When you close the game, everything is restored.
 
 ---
 
 ## 📊 Real-World Measurements
 
-These numbers come from `Measure-SteamRAM.ps1`, included in the project, run on a real session with Steam open in Large Library View.
+Measured with `src/Bench-SESO.ps1` and a load test on a real system: Steam opened with Store, Community and Library pages browsed, then a game (Cossacks 3) launched.
 
-These benchmarks represent average test values recorded on a laptop with  ⚠️8 GB RAM ⚠️. Actual RAM usage and savings may vary slightly depending on your system configuration and active Steam features.
+| Moment | Steam RAM (working set) |
+|---|---:|
+| Before the game, Store pages loaded | **1613 MB** |
+| In game, +5 s (background mode applied) | 224 MB |
+| In game, +15 s | 287 MB |
+| In game, +30 s | 506 MB |
+| In game, +60 s | 622 MB |
+| In game, +90 s (after periodic re-trim) | 194 MB |
+| After the game, +30 s (restored) | 807 MB |
 
-### Before SESO (Large Library View, idle)
+Over two weeks of normal use the watchdog log shows **560–1580 MB** moved out of RAM at every game launch.
 
-| Process | PID | RAM |
-|---|---|---:|
-| steamwebhelper | 13236 | 746.0 MB |
-| steamwebhelper | 1032 | 453.4 MB |
-| steamwebhelper | 10744 | 166.9 MB |
-| steamwebhelper | 11548 | 129.9 MB |
-| steam | 5228 | 97.8 MB |
-| steamwebhelper | 11556 | 33.2 MB |
-| steamwebhelper | 12660 | 21.4 MB |
-| steamwebhelper | 11564 | 20.6 MB |
-| steamservice | 10192 | 14.0 MB |
-| steamwebhelper | 10400 | 13.6 MB |
-| **Total** | **10 processes** | **1696.7 MB** |
+### Why not just kill the renderers?
 
-### After SESO (game running, renderers offloaded)
-
-| Process | PID | RAM |
-|---|---|---:|
-| steamwebhelper | 10588 | 359.0 MB |
-| steamwebhelper | 10744 | 252.1 MB |
-| steam | 5228 | 98.9 MB |
-| steamwebhelper | 11548 | 71.2 MB |
-| steamwebhelper | 6412 | 48.1 MB |
-| steamwebhelper | 11556 | 32.6 MB |
-| steamwebhelper | 8264 | 21.6 MB |
-| steamservice | 10192 | 13.9 MB |
-| **Total** | **8 processes** | **897.4 MB** |
-
-### Summary
-
-| Metric | Before | After | Saved |
-|---|---:|---:|---:|
-| Total RAM | 1696.7 MB | 897.4 MB | **799.3 MB (~47%)** |
-| steamwebhelper processes | 8 | 6 | −2 |
-| Total background processes | 10 | 8 | −2 |
-
-> The surviving heavy processes (`MAIN` and `gpu-process`) are structural — they host the Steam window and GPU compositing respectively and cannot be removed without crashing the interface. SESO kills everything above that floor that can be safely respawned.
+Earlier versions killed `steamwebhelper` renderers. Measured, it made things worse: Steam respawned them within seconds and total RAM went **up by 160 MB** (still +94 MB after 2 minutes). Background mode keeps the processes and only takes their memory away.
 
 ---
 
-## 🔬 How the offload works
+## 🔬 How background mode works
 
-SESO maps each `steamwebhelper.exe` by its `--type` flag before deciding what to kill:
-
-| CEF process type | Role | SESO action |
+| Measure | Windows API | Effect |
 |---|---|---|
-| `MAIN` (no flag) | Hosts all child CEF processes, owns the Steam window | **Keep** |
-| `gpu-process` | GPU compositing, in-game overlay rendering | **Keep** |
-| `network.mojom.NetworkService` | Network stack — Friends, notifications, overlay | **Keep** |
-| `renderer` | One per open tab: Store, Library, Community | **Kill** |
-| `storage.mojom.StorageService` | Browser cache service | **Kill** |
-| `crashpad-handler` | Crash reporter | **Kill** |
+| Trim working set | `EmptyWorkingSet` | Pages leave RAM; they return only if Steam actually touches them |
+| Very low memory priority | `SetProcessInformation(ProcessMemoryPriority)` | Under memory pressure Windows evicts Steam's pages first, not the game's |
+| Efficiency mode (EcoQoS) | `SetProcessInformation(ProcessPowerThrottling)` | Scheduler runs Steam on efficient cores/clocks |
+| Below-normal CPU priority | `PriorityClass` | Steam never competes with the game for CPU |
 
-After the offload, the Friends list remains reachable — opening it causes Steam to spin up exactly one new `renderer` (~50 MB) for that panel alone.
+The trim is repeated 20 s after launch (Steam is busy with overlay/cloud sync right then) and every 60 s while you play. Everything is reverted 15 s after the last game exits — so switching from one game to another does not flip the Steam UI back and forth.
 
 ---
 
@@ -116,31 +86,30 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManage
 
 ## ⚙️ How It Works
 
-A lightweight PowerShell watchdog monitors Steam in the background.
+A lightweight PowerShell watchdog monitors Steam in the background. It uses the event-driven ETW process trace (no polling) and only reacts to processes from `steamapps\common`, so it does no work while you are not starting games.
 
 | Event | Action |
 |---|---|
-| Game launched | Switches Steam to Mini Games List and offloads browser renderers |
-| Game closed | Restores the Large Games List; Steam reloads tabs on demand |
+| Game launched | Switches Steam to Mini Games List and puts `steamwebhelper` into background mode |
+| Game closed | After 15 s without games, restores normal mode and the Large Games List |
 | New game installed | Automatically added to the database |
 | Game uninstalled | Automatically removed |
-| Unknown game launched | Performs a quick rescan and applies optimization |
+| Unknown game launched | Reads only the manifest that owns that folder (~5 ms instead of a full ~130 ms rescan) and remembers the game |
 
 ---
 
 ## 📏 Measuring RAM yourself
 
-The project includes `src/Measure-SteamRAM.ps1` — the same script used to produce the numbers above.
+`src/Bench-SESO.ps1` reproduces the numbers above:
 
 ```powershell
-# Take a snapshot before starting a game
-.\Measure-SteamRAM.ps1 -Label "before"
-
-# Start a game, wait ~30 seconds for SESO to act, then snapshot again
-.\Measure-SteamRAM.ps1 -Label "after"
+cd C:\Scripts\Steam-EcoSystem-Optimizer-main\src
+powershell -ExecutionPolicy Bypass -File .\Bench-SESO.ps1 -Steam
 ```
 
-Each run appends a row to `seso-ram-log.csv` so you can track results across multiple sessions. Run the pair 3–5 times on different days for a stable average.
+It measures the cost of game detection, then Steam RAM in Mini Games List alone vs. Mini Games List + background mode, and writes the results to `seso-bench.txt`. Run it with Steam open and no game running.
+
+`src/Measure-SteamRAM.ps1 -Label "before"` / `-Label "after"` takes simple snapshots into `seso-ram-log.csv`.
 
 ---
 
@@ -174,7 +143,7 @@ Yes — everything is in this repository. `Install.ps1`, `SteamWatchdog.ps1`, an
 <summary><b>Does SESO affect the Steam Overlay or disable any Steam features?</b></summary>
 <br>
 
-No. SESO never terminates the `gpu-process` or `NetworkService` CEF processes — these are responsible for the Steam Overlay, GPU compositing, friends, notifications, and chat.  
+No. SESO does not terminate any Steam process — it only lowers their priority and moves their memory out of RAM.  
 All core Steam functionality remains fully operational during gameplay, including the overlay, screenshots, chat, and the friends list.
 </details>
 
@@ -209,7 +178,7 @@ No. The watchdog runs silently in the background via Task Scheduler.
 <summary><b>Can SESO break Steam?</b></summary>
 <br>
 
-No. SESO only terminates renderer-type `steamwebhelper` processes — the ones Steam safely respawns when needed. Core processes (`MAIN`, `gpu-process`, `NetworkService`) are never touched.
+No. SESO never kills Steam processes. It uses the same documented Windows APIs that Task Manager's Efficiency mode uses, and reverts everything when you stop playing.
 </details>
 
 <details>
@@ -241,10 +210,10 @@ Yes, but behavior may vary slightly if Valve changes the underlying CEF process 
 </details>
 
 <details>
-<summary><b>Why do some steamwebhelper processes remain after offload?</b></summary>
+<summary><b>Why does Steam's RAM grow back a bit during the game?</b></summary>
 <br>
 
-Because they're structural: `MAIN` hosts the Steam window, `gpu-process` handles GPU compositing and overlay, and `NetworkService` handles friends, notifications, and chat. Removing any of them would crash Steam — see [How the offload works](#-how-the-offload-works) for the full breakdown.
+Trimmed pages come back only when Steam touches them (Mini Games List, overlay, downloads). SESO re-trims every 60 s, so Steam stays in the 0.2–0.6 GB range instead of 1.6 GB.
 </details>
 
 <details>
@@ -298,15 +267,14 @@ Get-Content .\watchdog.log -Wait
 
 | File | Description |
 |---|---|
-| `Install.ps1` | Main installer. Registers scheduled tasks and starts SESO. |
+| `Install.ps1` | Installer and updater. Stops an older SESO, scans libraries once, registers and starts the watchdog. |
 | `Uninstall.ps1` | Removes SESO, scheduled tasks, and generated files. |
-| `SteamWatchdog.ps1` | Watches for game launches and exits; handles the CEF offload. |
-| `SteamScanner.ps1` | Scans Steam libraries and maintains the game database. |
-| `Common.ps1` | Shared helper functions. |
-| `RunScannerHidden.vbs` | Starts the scanner without a visible console. |
+| `SteamWatchdog.ps1` | Watches for game launches and exits; switches Steam to background mode. |
+| `SteamScanner.ps1` | One-time full library scan (run by the installer). |
+| `Common.ps1` | Shared helpers: library scan, manifest parsing, background mode. |
 | `RunWatchdogHidden.vbs` | Starts the watchdog without a visible console. |
 | `src/Measure-SteamRAM.ps1` | Snapshots Steam RAM usage and logs results to CSV. |
-| `src/Identify-SteamWebHelpers.ps1` | Maps each steamwebhelper process to its CEF role. |
+| `src/Bench-SESO.ps1` | Benchmark: detection cost and Steam RAM with/without background mode. |
 | `gamelist.json` | Automatically generated game database. |
 | `watchdog.log` | Runtime log file. |
 
