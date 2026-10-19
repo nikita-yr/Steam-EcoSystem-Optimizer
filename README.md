@@ -3,7 +3,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/powershell-5.1-5391FE?logo=powershell&logoColor=white" alt="PowerShell 5.1">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white" alt="Windows 10 | 11">
-  <img src="https://img.shields.io/badge/size-%7E55%20KB-lightgrey" alt="~55 KB">
+  <img src="https://img.shields.io/badge/size-54%20KB-lightgrey" alt="54 KB">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
 </p>
 
