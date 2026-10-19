@@ -3,12 +3,12 @@
 <p align="center">
   <img src="https://img.shields.io/badge/powershell-5.1-5391FE?logo=powershell&logoColor=white" alt="PowerShell 5.1">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows&logoColor=white" alt="Windows 10 | 11">
-  <img src="https://img.shields.io/badge/size-%7E80%20KB-lightgrey" alt="~94,4 КБ">
+  <img src="https://img.shields.io/badge/size-%7E55%20KB-lightgrey" alt="~55 KB">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
 </p>
 
 <p align="center">
-  Cuts Steam's RAM footprint by <b>~75–85%</b> while you play (measured: <b>1.6 GB → 0.2–0.6 GB</b>) — helping reduce micro-stutters and improve 1% Low FPS.<br>
+  Cuts Steam's RAM footprint by <b>~60–88%</b> while you play (measured: <b>1.6 GB → 0.2–0.6 GB</b>) — helping reduce micro-stutters and improve 1% Low FPS.<br>
   No clicks. No background UI clutter. No configuration.
 </p>
 
@@ -178,7 +178,7 @@ No. The watchdog runs silently in the background via Task Scheduler.
 <summary><b>Can SESO break Steam?</b></summary>
 <br>
 
-No. SESO never kills Steam processes. It uses the same documented Windows APIs that Task Manager's Efficiency mode uses, and reverts everything when you stop playing.
+It's designed not to. SESO never kills Steam processes: it uses the same documented Windows APIs that Task Manager's Efficiency mode uses, and reverts everything when you stop playing. If you do hit a problem, run `Disable.ps1` or `Uninstall.ps1` and please open an issue.
 </details>
 
 <details>
