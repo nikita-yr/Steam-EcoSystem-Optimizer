@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  Cuts Steam's RAM footprint by <b>~60–88%</b> while you play (measured: <b>1.6 GB → 0.2–0.6 GB</b>) — helping reduce micro-stutters and improve 1% Low FPS.<br>
+  Cuts Steam's RAM footprint by <b>~60–88%</b> while you play (measured: <b>1.6 GB → 0.2–0.6 GB</b>) — which can help reduce micro-stutters on memory-constrained systems.<br>
   No clicks. No background UI clutter. No configuration.
 </p>
 
@@ -24,7 +24,7 @@
 
 ## ⚡ Why SESO?
 
-Steam keeps multiple Chromium (`steamwebhelper.exe`) processes alive even while you're in-game. Those background web views can consume **1.5–1.7 GB of RAM**, increasing paging activity and causing inconsistent frame times on memory-constrained systems.
+Steam keeps multiple Chromium (`steamwebhelper.exe`) processes alive even while you're in-game. Those background web views can consume **1.5–1.7 GB of RAM**, which increases paging activity and can cause inconsistent frame times on memory-constrained systems.
 
 SESO watches for game launches in the background and puts every `steamwebhelper` into a *background mode* using documented Windows APIs: its memory is moved out of RAM, it gets the lowest memory priority, Efficiency mode (EcoQoS) and below-normal CPU priority. Nothing is killed, so Steam, the overlay, friends and chat keep working. When you close the game, everything is restored.
 
@@ -192,7 +192,7 @@ Yes. Steam automatically reloads the Store, Library, and Community tabs on deman
 <summary><b>Does SESO increase FPS?</b></summary>
 <br>
 
-Indirectly. By reducing RAM pressure and paging, SESO improves frame-time consistency, micro-stutter frequency, and 1% Low FPS stability. It does not "boost FPS" directly — there's no GPU or CPU optimization involved.
+Not directly. By reducing RAM pressure and paging, SESO can help frame-time consistency and 1% Low FPS on systems that are short on RAM. FPS has not been benchmarked yet, so treat this as expected behavior, not a measured result; on PCs with plenty of free RAM the difference may be negligible. There's no GPU or CPU optimization involved.
 </details>
 
 <details>
@@ -269,6 +269,7 @@ Get-Content .\watchdog.log -Wait
 |---|---|
 | `Install.ps1` | Installer and updater. Stops an older SESO, scans libraries once, registers and starts the watchdog. |
 | `Uninstall.ps1` | Removes SESO, scheduled tasks, and generated files. |
+| `Disable.ps1` | Turns off autostart and stops the watchdog without removing any files. Run `Install.ps1` to re-enable. |
 | `SteamWatchdog.ps1` | Watches for game launches and exits; switches Steam to background mode. |
 | `SteamScanner.ps1` | One-time full library scan (run by the installer). |
 | `Common.ps1` | Shared helpers: library scan, manifest parsing, background mode. |
